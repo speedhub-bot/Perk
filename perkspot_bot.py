@@ -9,8 +9,8 @@ Requirements:
   pip install python-telegram-bot==20.7 curl_cffi rarfile
 
 Setup:
-  export BOT_TOKEN="your_token"
-  export ADMIN_ID="your_telegram_id"  (optional)
+  export BOT_TOKEN="8823280222:AAGNdYYTXeV2uA_8LS4Rz_QviRGrIGV2eaQ"
+  export ADMIN_ID="5944410248"  (optional)
   python3 perkspot_bot.py
 """
 
